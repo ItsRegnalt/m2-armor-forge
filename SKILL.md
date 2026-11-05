@@ -88,31 +88,48 @@ client and files; clients differ.
 
 ## 2. Inputs (confirm every time)
 
-The user provides, in this order:
+The user hands over **only these three files**, plus the design references:
 
-1. **Original armored model** from the game (`.gr2`, FBX or OBJ + textures).
-2. **Naked body model** of the same race / gender (same skeleton).
-3. **Meshy sample armor** (generated mesh / render): design reference only.
-4. **Design references**: images, and models when found.
+| # | File | Contents |
+|---|---|---|
+| 1 | Original armor `.fbx` | The game's armored body part with skeleton, weights and textures |
+| 2 | Naked model `.fbx` | The naked body of the same race / gender, same skeleton |
+| 3 | Head / neck part `.fbx` | Only the head + neck part (face, hair) that sits on top of the armor |
+| + | References | Meshy sample armor, images, models when found (design only) |
 
-**Every session and every time new files arrive, confirm receipt with an input card** before doing anything else.
-Run `m2a_checks.inputs_report()` and post a short table:
+**Everything else is this skill's job, not the user's**: importing, overlaying the three models in one space,
+checking they share one skeleton, locking them as references, splitting the original armor into its pieces and
+grouping them (collar, pauldrons, bracers, gloves, torso, belt / waist, thighs, knee / shin, boots), finding the neck
+join type, taking the lock snapshot, preparing the Meshy sample and the reference boards. Never ask the user to
+separate, align or export parts.
 
-| Slot | File | Loaded as | Bones | Verts / tris | Materials / textures | Status |
-|---|---|---|---|---|---|---|
+**Every session and every time new files arrive**, run
 
-Status is `OK`, `MISSING` or `PROBLEM: <reason>`. Also state:
+```python
+inp = m2a_checks.prepare_inputs(armor_fbx, naked_fbx, head_fbx)
+```
 
-- The skeletons of 1 and 2 match (same bone names, hierarchy, bind pose within 0.1 mm) or list the differences.
-- Which neck join the original uses (skin join or covering join).
-- Which head part (if any) was supplied for seam checks.
-- The lock snapshot was taken (`lock_snapshot`): head / neck bone positions and neck border height in cm.
+and post its input card before doing anything else:
 
-Also read the units of the OBJ / FBX (compare the original's height with a known character height) and state the
-scene unit scale you used.
+| Slot | File | Meshes | Bones | Tris | Status |
+|---|---|---|---|---|---|
 
-Missing slot 1 or 2: stop and ask for it; the work cannot start without both. Missing 3 or 4: say so and continue
-only with the user's agreement.
+Status is `OK`, `MISSING` or `PROBLEM: <reason>`. Then state in one or two lines:
+
+- Skeleton armor vs naked and armor vs head: `identical` or the differences.
+- Neck join of the original (skin join or covering join).
+- The original armor's piece groups (region: piece count).
+- The lock snapshot: neck border height and radius.
+- Units: compare the character height with a plausible one and state the scale used. Never move, scale or rotate
+  the imported references.
+
+`prepare_inputs` puts the files in `REF_OrigArmor`, `REF_Naked`, `REF_Head` and the grouped pieces in
+`REF_OrigArmor_Parts_<region>`; all of them are locked (not selectable, transforms locked). Our work goes in
+`ARM_<piece>` objects in a `<Armor>_vN` collection, never into a `REF_` collection.
+
+Any of the three files missing or broken (no skeleton, no mesh): stop and ask for exactly that file; the work cannot
+start without all three. Missing references: say so and continue only with the user's agreement. If the user can only
+give OBJ, use OBJ mode (§1) and say which checks cannot run.
 
 ## 3. Reference roles
 
@@ -160,7 +177,7 @@ Study the original armored model first (solo 360° review of each of its parts, 
 The armor may have more polygons and larger textures than the original, but it must stay a game-ready asset.
 
 1. **Calibrate from a modern Metin2 armor.** Recent Metin2 armors and costumes are much busier than the 2006 ones.
-   Ask the user for one recent armor / costume from the same game (OBJ + textures is enough) and run
+   Do not ask for extra files; if the user offers a recent armor / costume (OBJ + textures is enough), run
    `budget_report([ours...], calibrate=[recent_armor])`: its triangle count + 15%, its largest texture and its
    material count become the limits.
 2. **Defaults when no calibration model is given** (estimates, not verified Metin2 data): body armor ≤ 12,000
@@ -331,7 +348,9 @@ Fit and proportion, locks (skeleton, head, region drift), part clipping and the 
 
 | Function | What it does |
 |---|---|
-| `inputs_report(armored, naked, armature_a=None, armature_n=None)` | Input card data: counts, materials, textures, skeleton match |
+| `prepare_inputs(armor_fbx, naked_fbx, head_fbx)` | Imports the 3 FBX, checks one skeleton, locks them, splits + groups the original armor, takes the lock snapshot, prints the input card |
+| `group_parts(obj, prefix, col_name)` / `lock_objects(objs)` | Piece grouping by dominant bone / reference lock |
+| `inputs_report(armored, naked, armature_a=None, armature_n=None)` | Input card for already-loaded objects |
 | `lock_snapshot(armature, body, head_bones=None)` | Records skeleton + head position locks from the original |
 | `lock_check(snapshot, armature, armor=None, tol=1e-4)` | Verifies skeleton and head position are unchanged |
 | `rig_report(arm_a, arm_b, tol=1e-4)` | Bone names, parents, bind-pose heads / tails / rolls compared |

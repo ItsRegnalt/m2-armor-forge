@@ -54,16 +54,31 @@ git clone https://github.com/ItsRegnalt/m2-armor-forge.git ~/.claude/skills/m2-a
 
 Restart Claude Code. Update later with `git pull` in each folder.
 
+## What you give
+
+Apart from the design references, you hand over only three files:
+
+1. **Original armor** `.fbx` (the game's armored body part, with skeleton)
+2. **Naked model** `.fbx` (same race / gender, same skeleton)
+3. **Head / neck part only** `.fbx`
+
+Plus references: a Meshy sample armor, images and models when you have them.
+
+The skill does all the rest: overlaying, locking, splitting and grouping the armor pieces, preparing the references.
+FBX is needed because it carries the skeleton and weights; OBJ has no skeleton (the skill can work with OBJ, but
+the rig and pose checks then cannot run).
+
 ## Usage
 
 ```text
-/m2-armor-forge Here are the original warrior armor (warrior_armor_01.gr2) and the naked warrior body.
-Next I'll send a Meshy sample and references for a dark-knight armor.
+/m2-armor-forge 1) warrior_armor_01.fbx  2) warrior_naked.fbx  3) warrior_head.fbx
+References: meshy_darkknight.glb and three images of the design.
 ```
 
 What you will see:
 
-1. An input card confirming both base models (or asking for the missing one).
+1. An input card confirming the three FBX files (or asking for the missing one), the skeleton match, the neck join
+   type and the original armor's piece groups.
 2. A lock snapshot: skeleton, head / neck position.
 3. Region-by-region work with collages, proportion tables, clipping and pose reports.
 4. Macro loop rounds until clean, then export notes and the `.msm` / `item_proto` / `item_list.txt` lines to add.
@@ -90,8 +105,10 @@ per pose), macro close-up renders, DDS header reader. See `SKILL.md` for the ful
 
 ## Türkçe özet
 
-**m2-armor-forge**, Metin2 için yeni zırh tasarlatan bir Claude Code skill'idir. Oyunun orijinal zırhlı modelini ve
-kıyafetsiz modeli her seferinde teyit eder, ardından Meshy örneği ve referanslarla kıyafetsiz gövdeyi giydirir.
+**m2-armor-forge**, Metin2 için yeni zırh tasarlatan bir Claude Code skill'idir. Kullanıcı referanslar dışında yalnız
+3 dosya verir: 1) orijinal zırh `.fbx`, 2) kıyafetsiz model `.fbx`, 3) yalnız kafa-boyun parçası `.fbx`. Üst üste
+koyma, kilitleme, parçalara bölme ve gruplama gibi geri kalan her şeyi skill yapar. Dosyaları her seferinde
+teyit eder, ardından Meshy örneği ve referanslarla kıyafetsiz gövdeyi giydirir.
 Orijinal iskeleti, kafa konumunu ve boyun dikişini kilitler; göğüs / omuz / kalça kaymasına, omuz genişliği ve
 şişmanlığa karşı ölçüm yapar; kemer, omuzluk, eldiven, bot, dizlik gibi parçaların birbirine clip etmesini her pozda
 ayrı ayrı kontrol eder ve her bölgenin farklı pozlarda makro fotoğrafını çekip temiz çıkana kadar düzeltir.

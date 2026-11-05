@@ -1080,3 +1080,141 @@ def budget_report(objs, max_tris=None, max_tex=None, max_mats=None, calibrate=()
     _table(rows, ('object', 'tris', 'max tex', 'materials', 'status'))
     print(f'budget: limits tris {max_tris} tex {max_tex} materials {max_mats}')
     return dict(ok=ok, total=tot, limits=dict(tris=max_tris, tex=max_tex, mats=max_mats), problems=st)
+
+
+# ---------------------------------------------------------------------------------------------------------- input preparation
+REGION_RULES = (  # (bone-name keywords, region) - first match wins; side added from ' L ' / ' R ' in the bone name
+    (('head', 'neck'), 'collar'),
+    (('clavicle',), 'pauldron'),
+    (('upperarm',), 'upperarm'),
+    (('forearm',), 'bracer'),
+    (('hand', 'finger'), 'glove'),
+    (('spine', 'chest'), 'torso'),
+    (('pelvis', 'bip01'), 'belt_waist'),
+    (('thigh',), 'thigh'),
+    (('calf', 'knee'), 'knee_shin'),
+    (('foot', 'toe'), 'boot'),
+)
+
+
+def _region_of_bone(name):
+    n = ' ' + name.lower().replace('_', ' ') + ' '
+    side = '_L' if ' l ' in n else '_R' if ' r ' in n else ''
+    for keys, region in REGION_RULES:
+        if any(k in n for k in keys):
+            return region + side
+    return 'other'
+
+
+def _dominant_bone(o):
+    acc = defaultdict(float)
+    for gs in _groups_by_vertex(o):
+        for n, w in gs:
+            acc[n] += w
+    return max(acc, key=acc.get) if acc else None
+
+
+def _col(name, parent=None):
+    c = bpy.data.collections.get(name) or bpy.data.collections.new(name)
+    p = parent or bpy.context.scene.collection
+    if c.name not in [x.name for x in p.children]:
+        p.children.link(c)
+    return c
+
+
+def _import_fbx(path, col_name):
+    before = set(bpy.data.objects)
+    bpy.ops.import_scene.fbx(filepath=path, automatic_bone_orientation=False, ignore_leaf_bones=False)
+    new = [o for o in bpy.data.objects if o not in before]
+    col = _col(col_name)
+    for o in new:
+        for c in list(o.users_collection):
+            c.objects.unlink(o)
+        col.objects.link(o)
+    return col, new
+
+
+def lock_objects(objs):
+    """Reference lock: not selectable, transforms locked (nothing can move them by accident)."""
+    for o in objs:
+        o.hide_select = True
+        o.lock_location = o.lock_rotation = o.lock_scale = (True, True, True)
+
+
+def group_parts(obj, prefix, col_name):
+    """Split a work copy of `obj` into loose parts and group them by the bone they mostly follow
+    (collar, pauldron_L, glove_R, belt_waist, boot_L ...). Returns {region: [objects]}."""
+    parts = split_parts(obj, 'LOOSE')
+    col = _col(col_name)
+    groups = defaultdict(list)
+    for p in parts:
+        region = _region_of_bone(_dominant_bone(p) or '')
+        groups[region].append(p)
+    for region, ps in groups.items():
+        sub = _col(f'{col_name}_{region}', col)
+        for i, p in enumerate(ps):
+            p.name = f'{prefix}_{region}_{i:02d}'
+            for c in list(p.users_collection):
+                c.objects.unlink(p)
+            sub.objects.link(p)
+    lock_objects([p for ps in groups.values() for p in ps])
+    _table([(r, len(ps), sum(len(p.data.polygons) for p in ps)) for r, ps in sorted(groups.items())],
+           ('region', 'pieces', 'faces'))
+    return dict(groups)
+
+
+def prepare_inputs(armor_fbx, naked_fbx, head_fbx):
+    """The user gives only three FBX files (plus design references). This does the rest:
+    import each into its own collection, check they share one skeleton and one space (overlay), take the lock
+    snapshot, lock the references and split + group the original armor into its pieces."""
+    import os
+    rep = {}
+    slots = (('original_armor', armor_fbx, 'REF_OrigArmor'), ('naked_body', naked_fbx, 'REF_Naked'),
+             ('head_part', head_fbx, 'REF_Head'))
+    loaded = {}
+    for slot, path, col in slots:
+        if not path or not os.path.exists(path):
+            rep[slot] = 'MISSING'
+            continue
+        _, objs = _import_fbx(path, col)
+        meshes = [o for o in objs if o.type == 'MESH']
+        arms = [o for o in objs if o.type == 'ARMATURE']
+        loaded[slot] = dict(meshes=meshes, arm=arms[0] if arms else None, file=os.path.basename(path))
+        rep[slot] = 'OK' if meshes and arms else ('PROBLEM: no skeleton in FBX' if meshes else 'PROBLEM: no mesh')
+    rows = []
+    for slot, _, _ in slots:
+        L = loaded.get(slot)
+        if not L:
+            rows.append((slot, '-', '-', '-', '-', rep[slot]))
+            continue
+        tris = 0
+        for m in L['meshes']:
+            m.data.calc_loop_triangles()
+            tris += len(m.data.loop_triangles)
+        rows.append((slot, L['file'], len(L['meshes']), len(L['arm'].data.bones) if L['arm'] else 0, tris, rep[slot]))
+    _table(rows, ('slot', 'file', 'meshes', 'bones', 'tris', 'status'))
+    if any(v != 'OK' for v in rep.values()):
+        print('INPUTS NOT COMPLETE: ask the user for the missing / broken file(s).')
+        return dict(ok=False, slots=rep, loaded=loaded)
+    A, N, H = loaded['original_armor'], loaded['naked_body'], loaded['head_part']
+    # one skeleton, one space: all three rigs must be identical (head part may carry only its own bones)
+    rep['skeleton_armor_vs_naked'] = rig_report(A['arm'], N['arm'], quiet=True)['status']
+    hr = rig_report(A['arm'], H['arm'], quiet=True)
+    rep['skeleton_armor_vs_head'] = 'identical' if not hr['changed'] and not hr['extra'] else 'DIFFERENT'
+    for k in ('skeleton_armor_vs_naked', 'skeleton_armor_vs_head'):
+        print(k, rep[k])
+    body = max(N['meshes'], key=lambda m: len(m.data.vertices))
+    armor = max(A['meshes'], key=lambda m: len(m.data.vertices))
+    head = max(H['meshes'], key=lambda m: len(m.data.vertices))
+    snap = lock_snapshot(A['arm'], body)
+    seam = 'skin' if neck_border(armor, A['arm']) else 'covering'
+    print('neck join of the original armor:', seam)
+    parts = defaultdict(list)
+    for m in A['meshes']:  # split before locking: the work copies must stay editable while separating
+        for k, v in group_parts(m, 'ORIG', 'REF_OrigArmor_Parts').items():
+            parts[k] += v
+    lock_objects([o for L in loaded.values() for o in L['meshes'] + [L['arm']]])
+    ok = rep['skeleton_armor_vs_naked'] == 'identical' and rep['skeleton_armor_vs_head'] == 'identical'
+    print('INPUTS READY' if ok else 'INPUTS LOADED, SKELETON MISMATCH: report it before working')
+    return dict(ok=ok, slots=rep, armature=A['arm'], body=body, armor=armor, head=head, snapshot=snap,
+                seam=seam, parts=dict(parts), loaded=loaded)
