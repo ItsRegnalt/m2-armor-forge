@@ -72,10 +72,19 @@ client and files; clients differ.
   compare bounds after every round trip.
 - **Textures.** Diffuse **alpha is the specular mask, not transparency.** Cut-outs (fur fringe, chain gaps, cloth
   tears) need the material's opacity map / alpha-test setup used by the original. Texture paths are written as
-  `d:\ymir work\...`. Keep the original's texture size and DDS compression unless the user says otherwise.
+  `d:\ymir work\...`. Texture size follows the budget (§5b); keep the original's DDS compression type.
 - **Tooling.** Either the Blender extension *M2 Granny Tools* (Blender 4.2+, Windows, imports/exports `.gr2`, `.msm`,
   `.mdatr`, keeps bind pose of scaled helpers), or 3ds Max (2018 is the most reported working version) with the Granny
-  2.11.8 exporter, with Noesis for `.gr2` → FBX. Ask which one the user has; never download tools without approval.
+  2.11.8 exporter, with Noesis for `.gr2` → FBX, or the user's own tool. Ask which one the user has; never download
+  tools without approval.
+- **OBJ mode.** Many users export the game models as OBJ + textures from their own tool. OBJ carries geometry, UVs and
+  materials in bind pose but **no skeleton and no weights**. Then:
+  - Ask once whether the tool can also export the skeleton (FBX / SMD / `.gr2`). If yes, use it for the rig checks.
+  - If not, work in rig-free mode: the original armor OBJ is the position frame. Head position = its neck border;
+    proportions and drift = `band_report(original_armor, ours)` (and against the naked body); head join =
+    `strict_seam_report` + `neck_join_compare` with `poses={'bind': {}}`. Weights, pose tests and pose clipping are
+    then done in the user's tool or after they supply a skeleton; say clearly which checks could not run.
+  - Never move, scale or rotate the imported OBJs: compare bounds of the original before and after import.
 
 ## 2. Inputs (confirm every time)
 
@@ -98,6 +107,9 @@ Status is `OK`, `MISSING` or `PROBLEM: <reason>`. Also state:
 - Which neck join the original uses (skin join or covering join).
 - Which head part (if any) was supplied for seam checks.
 - The lock snapshot was taken (`lock_snapshot`): head / neck bone positions and neck border height in cm.
+
+Also read the units of the OBJ / FBX (compare the original's height with a known character height) and state the
+scene unit scale you used.
 
 Missing slot 1 or 2: stop and ask for it; the work cannot start without both. Missing 3 or 4: say so and continue
 only with the user's agreement.
@@ -141,8 +153,24 @@ Study the original armored model first (solo 360° review of each of its parts, 
 - Which body areas are replaced by armor and which keep skin (hands, feet, neck).
 - Layer order (undershirt → padding → mail → plates → belts / straps → ornaments) and where layers overlap.
 - Where geometry is split and where it is one skin.
-- Polygon count per area and texture texel density. The new armor stays within ±20% of the original's total
-  triangle count unless the user sets a budget.
+- Polygon count per area and texture texel density (for information; the budget is set in §5b).
+
+### 5b. Budget (game-ready, not 2006-limited)
+
+The armor may have more polygons and larger textures than the original, but it must stay a game-ready asset.
+
+1. **Calibrate from a modern Metin2 armor.** Recent Metin2 armors and costumes are much busier than the 2006 ones.
+   Ask the user for one recent armor / costume from the same game (OBJ + textures is enough) and run
+   `budget_report([ours...], calibrate=[recent_armor])`: its triangle count + 15%, its largest texture and its
+   material count become the limits.
+2. **Defaults when no calibration model is given** (estimates, not verified Metin2 data): body armor ≤ 12,000
+   triangles, one 1024² texture (2048² only when the design needs it), ≤ 3 materials.
+3. **Meshy is decimated away, not reduced.** Meshy meshes are 30k-300k+ triangle soup with baked lighting. Use them
+   only as a shape guide (blueprints, slices with `rf_trace`, silhouettes); build clean low-poly geometry on the
+   body base, then bake fine Meshy / high-poly detail into the diffuse texture if useful.
+4. Spend triangles where they change the silhouette (pauldrons, collar, belt, skirt edges, boot cuffs) and on joint
+   loops; flat surfaces stay light.
+5. `budget_report` must say `OK` before delivery.
 
 Production order:
 
@@ -221,6 +249,33 @@ The automatic compare-and-fix loop of reference-forge §7, run on close-ups:
 5. Stall rule (reference-forge §8): three rounds without improvement in a region → change approach (split the
    piece, re-topologise the joint, re-transfer weights from another source).
 
+## 7d. Head-join verification (100% rule)
+
+Runs after the armor design is finished, and again after every later change near the neck. The design may only be
+*similar* to the references (normal scoring, §8), but the **fit of the head on the armor is not scored: it must be
+perfect** (target 100%, nothing like the 90% rule). Compare the original armor + head and our armor + head side by
+side with every method below, in every view and every pose:
+
+| Method | Tool | Pass condition |
+|---|---|---|
+| Skeleton and head position | `lock_check` | `LOCKS OK` |
+| Border geometry (skin join) | `strict_seam_report(head, ours)` | same border vertex count, gap ≤ 0.00001 units, normal angle ≤ 1°, weight difference ≤ 0.001 |
+| Seam colour (skin join) | `seam_color_report(head, ours)` | ΔE ≤ 1 across the seam (re-run after every texture change) |
+| Leak test | `neck_join_compare` | 0 magenta pixels: an emissive core inside the neck must never show through a gap, hole or flipped face |
+| Head coverage | `neck_join_compare` | visible-head mask IoU vs original ≥ 0.99999 (skin join); covering join: no head-neck vertex visible outside the collar |
+| Side-by-side images | `neck_join_compare` | `<pose>/<view>.png` = original \| ours \| difference, 26 views × all poses incl. `head_turn` |
+| Close-ups | `macro_shots(..., regions=('neck', 'clavicle', 'head'))` | visual: no seam line, shading break, texture jump, z-fighting |
+| Game check | user's client / Granny viewer, if available | same as above in wait, run, attack animations |
+
+`head_join_gate(armature, head, orig_armor, ours, out_dir, snapshot, seam=...)` runs the measurable ones together
+and returns `PASS` only when every check passes.
+
+Loop: run → read every failing image and number → fix in the armor (never the head or the rig) → re-run everything
+→ repeat. There is no "good enough" exit: the stall rule changes the approach (rebuild the neck ring from the head's
+border, copy the original's neck topology and weights, re-bake the skin colour), it never accepts a failure. If the
+original itself fails a check (e.g. it leaks in one view), ours must still pass; report the original's result too.
+Post a join collage each round: rows = worst views / poses, columns = Original, Ours, Difference.
+
 ## 8. Scoring (adapted)
 
 Same 90/100 working score as reference-forge, with Metin2 weights:
@@ -233,7 +288,7 @@ Same 90/100 working score as reference-forge, with Metin2 weights:
 | Game structure | 15 | Neck seam, part split like original, budget, UV density |
 | Texture and material | 10 | Palette, specular alpha, texel density, DDS settings |
 
-Fit and proportion, locks (skeleton, head, region drift), part clipping and neck seam are **gates**: any failure there blocks delivery whatever the total.
+Fit and proportion, locks (skeleton, head, region drift), part clipping and the head-join gate (§7d, 100%) are **gates**: any failure there blocks delivery whatever the total.
 
 ## 9. Textures
 
@@ -243,13 +298,13 @@ Fit and proportion, locks (skeleton, head, region drift), part clipping and neck
   alpha (metal high, cloth / skin low). Bake procedural LookDev with reference-forge `rf_lookdev.bake_pbr`, then
   combine BaseColor + an AO pass into diffuse and Metallic / Roughness into the alpha mask.
 - Skin areas near the neck use the head part's skin colour sampled from its texture (median in linear space).
-- Export `.dds` with the original's size and compression (check its header: DXT1 without alpha, DXT5 / DXT3 with
+- Export `.dds` within the budget size, with the original's compression type (check its header: DXT1 without alpha, DXT5 / DXT3 with
   alpha). `m2a_checks.dds_info(path)` reads the header.
 
 ## 10. Delivery
 
 1. Run all reports: locks (skeleton + head position), region shift, inputs, rig, weights, neck seam, proportion,
-   pose test, part clipping in all poses, last macro loop pass. Post the summary table.
+   pose test, part clipping in all poses, last macro loop pass, head-join gate `PASS`. Post the summary table.
 2. Final collage: rows = front, back, side, 3/4, two test poses; columns = Original armor, Meshy sample, references,
    Ours, Difference.
 3. Export through the user's tool (M2 Granny Tools or FBX → 3ds Max → Granny exporter). Re-import the exported file
@@ -291,7 +346,13 @@ Fit and proportion, locks (skeleton, head, region drift), part clipping and neck
 | `part_clip_report(parts, margin=0.0005, allowed=())` | Pairwise intersections and sunk vertices between pieces |
 | `pose_clip_test(armature, parts, body=None, poses=None)` | Part clipping (+ body poke-through) in every pose |
 | `macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None)` | Close-up renders of every region, 8 views, every pose |
+| `strict_seam_report(head, armor)` | Neck border vs the head part with the strict limits |
+| `seam_color_report(head, armor, max_de=1.0)` | Texture colour difference across the seam (ΔE) |
+| `neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None, views=None)` | Side-by-side ID renders, leak test, head mask IoU, 26 views × poses |
+| `head_join_gate(armature, head, orig_armor, our_armor, out_dir, snapshot, seam='skin')` | All head-join checks; PASS only if all pass |
 | `dds_info(path)` | Width, height, mip count, FourCC (DXT1 / DXT3 / DXT5) |
+| `band_report(ref, ours, bands=24, tol=0.01)` | Rig-free (OBJ) proportion and drift check by height bands |
+| `budget_report(objs, max_tris, max_tex, max_mats, calibrate=())` | Triangles, texture size, materials; limits from a recent armor |
 
 All functions return plain dicts / lists and print a short table. Units are scene units; set the scene unit scale to
 match the imported data before reading centimetres.

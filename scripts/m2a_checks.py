@@ -743,3 +743,340 @@ def macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None, r
         bpy.data.cameras.remove(cam_data)
     print(f'macro shots: {len(files)} images in {out_dir}')
     return files
+
+
+# ---------------------------------------------------------------------------------------------------------- head join (100% rule)
+STRICT = dict(gap=1e-5, angle=1.0, weight=1e-3, leak_px=0, head_iou=0.99999, delta_e=1.0)
+
+
+def sphere_views(n=26):
+    """26 directions: 6 faces, 12 edges, 8 corners of a cube (n=14: faces + corners)."""
+    import itertools
+    dirs = [Vector(d) for d in itertools.product((-1, 0, 1), repeat=3) if any(d)]
+    if n == 14:
+        dirs = [d for d in dirs if sum(map(abs, d)) in (1, 3)]
+    names = {}
+    for d in dirs:
+        lab = ''.join(s for s, c in zip(('xyz'), d) if c) or 'o'
+        sign = ''.join('+' if c > 0 else '-' for c in d if c)
+        names[f'{lab}{sign}'] = tuple(d.normalized())
+    return names
+
+
+def strict_seam_report(head, armor, lim=None):
+    """Seam between the HEAD part and our armor with the strict limits (gap, normal angle, weights)."""
+    lim = lim or STRICT
+    r = neck_seam_report(head, armor, tol=lim['gap'], angle_tol=lim['angle'])
+    r['ok'] = r.get('ok', False) and r.get('weight', 1) <= lim['weight']
+    print('strict seam:', 'OK' if r['ok'] else 'FAIL')
+    return r
+
+
+def _first_image(o):
+    for slot in _obj(o).material_slots:
+        m = slot.material
+        if m and m.use_nodes:
+            for n in m.node_tree.nodes:
+                if n.type == 'TEX_IMAGE' and n.image and n.image.size[0] > 0:
+                    return n.image
+    return None
+
+
+def _srgb_to_lab(c):
+    def lin(u):
+        return u / 12.92 if u <= 0.04045 else ((u + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(x) for x in c[:3])
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+    f = lambda t: t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
+    return (116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z)))
+
+
+def seam_color_report(head, armor, max_de=None):
+    """Texture colour on both sides of the neck seam (sampled at the border vertices' UVs). CIE76 delta E."""
+    import numpy as np
+    max_de = STRICT['delta_e'] if max_de is None else max_de
+    head, armor = _obj(head), _obj(armor)
+
+    def samples(o):
+        img = _first_image(o)
+        nb = neck_border(o)
+        if img is None or nb is None or not o.data.uv_layers:
+            return None
+        w, h = img.size
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, img.channels)
+        uv = o.data.uv_layers.active.data
+        idx = set(nb[0])
+        out = {}
+        for poly in o.data.polygons:
+            for li in poly.loop_indices:
+                vi = o.data.loops[li].vertex_index
+                if vi in idx:
+                    u, v = uv[li].uv
+                    out[vi] = px[min(h - 1, max(0, int(v * h))), min(w - 1, max(0, int(u * w)))][:3]
+        mw = o.matrix_world
+        return [(mw @ o.data.vertices[i].co, c) for i, c in out.items()]
+
+    sh, sa = samples(head), samples(armor)
+    if not sh or not sa:
+        print('seam colour: no texture / UV on', 'head' if not sh else 'armor')
+        return dict(ok=None, reason='no texture')
+    worst = 0.0
+    for p, c in sa:
+        q, d = min(sh, key=lambda t: (t[0] - p).length)
+        la, lb = _srgb_to_lab(c), _srgb_to_lab(d)
+        worst = max(worst, math.dist(la, lb))
+    ok = worst <= max_de
+    print(f'seam colour: {"OK" if ok else "FAIL"}  max delta E {worst:.2f} (limit {max_de})')
+    return dict(ok=ok, delta_e=worst)
+
+
+def neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None, views=None, res=512,
+                      size=None, seam='skin'):
+    """Side-by-side head-join check: original armor + head vs our armor + head, every view x every pose.
+    Per image: ID render (head red, armor green, leak core magenta, background black).
+      leak  = magenta pixels: a hole / gap at the join that shows the inside (must be 0)
+      head  = IoU of visible head pixels, original vs ours (skin join: must be ~1, the armor may not cover or
+              reveal the head differently)
+      armor = IoU of armor pixels in the neck window (informative; differs by design)
+    Writes out_dir/<pose>/<view>.png = [original | ours | difference]. Returns per-image metrics and a summary."""
+    import os
+    import numpy as np
+    arm, head = _obj(armature), _obj(head)
+    orig_armor, our_armor = _obj(orig_armor), _obj(our_armor)
+    poses = poses or DEFAULT_POSES
+    views = views or sphere_views(26)
+    nb = neck_border(our_armor, arm) or neck_border(orig_armor, arm)
+    centre = nb[2] if nb else arm.matrix_world @ arm.data.bones[0].head_local
+    rad = (sum((p - centre).length for p in nb[1]) / len(nb[1])) if nb else 0.08
+    size = size or rad * 5
+    scn = bpy.context.scene
+    saved_pose = _save_pose(arm)
+    _apply_pose(arm, {})
+    # leak core: emissive magenta cylinder inside the neck, following the neck bone
+    bpy.ops.mesh.primitive_cylinder_add(radius=rad * 0.8, depth=rad * 2.5, location=centre)
+    core = bpy.context.active_object
+    core.name = 'M2A_LeakCore'
+    nbone = next((b for b in arm.data.bones if 'neck' in b.name.lower()), None)
+    if nbone:
+        mw = core.matrix_world.copy()
+        core.parent = arm
+        core.parent_type = 'BONE'
+        core.parent_bone = nbone.name
+        core.matrix_world = mw
+    cols = {head.name: (1, 0, 0, 1), orig_armor.name: (0, 1, 0, 1), our_armor.name: (0, 1, 0, 1), core.name: (1, 0, 1, 1)}
+    old = dict(cam=scn.camera, x=scn.render.resolution_x, y=scn.render.resolution_y, pct=scn.render.resolution_percentage,
+               path=scn.render.filepath, engine=scn.render.engine, view=scn.view_settings.view_transform,
+               hide={o.name: o.hide_render for o in scn.objects}, color={o.name: tuple(o.color) for o in scn.objects},
+               light=scn.display.shading.light, ctype=scn.display.shading.color_type,
+               world=scn.world.color[:] if scn.world else None, aa=scn.display.render_aa)
+    cam_data = bpy.data.cameras.new('M2A_JoinCam')
+    cam_data.type = 'ORTHO'
+    cam_data.ortho_scale = size
+    cam_data.clip_start, cam_data.clip_end = 0.0005, size * 20
+    cam = bpy.data.objects.new('M2A_JoinCam', cam_data)
+    scn.collection.objects.link(cam)
+    if not scn.world:
+        scn.world = bpy.data.worlds.new('M2A_World')
+    results, summary = [], dict(leak_ours=0, leak_orig=0, head_iou_min=1.0, images=0)
+
+    def shoot(armor_obj, path):
+        for o in scn.objects:
+            if o.type in ('MESH', 'CURVE'):
+                o.hide_render = o.name not in (head.name, armor_obj.name, core.name)
+        scn.render.filepath = path
+        bpy.ops.render.render(write_still=True)
+        img = bpy.data.images.load(path, check_existing=False)
+        w, h = img.size
+        a = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, img.channels)[..., :3]
+        bpy.data.images.remove(img)
+        r, g, b = a[..., 0] > 0.5, a[..., 1] > 0.5, a[..., 2] > 0.5
+        return dict(head=r & ~g & ~b, armor=~r & g & ~b, leak=r & ~g & b)
+
+    def iou(m1, m2):
+        u = (m1 | m2).sum()
+        return 1.0 if u == 0 else float((m1 & m2).sum()) / float(u)
+
+    try:
+        try:
+            scn.render.engine = 'BLENDER_WORKBENCH'
+        except TypeError as e:
+            print('workbench not available:', e)
+        scn.display.shading.light = 'FLAT'
+        scn.display.shading.color_type = 'OBJECT'
+        scn.display.render_aa = 'OFF'
+        scn.world.color = (0, 0, 0)
+        try:
+            scn.view_settings.view_transform = 'Standard'
+        except TypeError:
+            pass
+        for n, c in cols.items():
+            scn.objects[n].color = c
+        scn.camera = cam
+        scn.render.resolution_x = scn.render.resolution_y = res
+        scn.render.resolution_percentage = 100
+        for pname, spec in poses.items():
+            _apply_pose(arm, spec)
+            c = core.matrix_world.translation.copy()
+            d = os.path.join(out_dir, pname)
+            os.makedirs(d, exist_ok=True)
+            for vname, dirv in views.items():
+                dv = Vector(dirv).normalized()
+                cam.location = c + dv * (size * 5)
+                cam.rotation_euler = (-dv).to_track_quat('-Z', 'Y' if abs(dv.z) > 0.9 else 'Z').to_euler()
+                po, pu = os.path.join(d, f'_o_{vname}.png'), os.path.join(d, f'_u_{vname}.png')
+                mo, mu = shoot(orig_armor, po), shoot(our_armor, pu)
+                rec = dict(pose=pname, view=vname, leak_orig=int(mo['leak'].sum()), leak_ours=int(mu['leak'].sum()),
+                           head_iou=iou(mo['head'], mu['head']), armor_iou=iou(mo['armor'], mu['armor']))
+                results.append(rec)
+                summary['leak_ours'] += rec['leak_ours']
+                summary['leak_orig'] += rec['leak_orig']
+                summary['head_iou_min'] = min(summary['head_iou_min'], rec['head_iou'])
+                summary['images'] += 1
+                # side by side: original | ours | difference (red = only original, green = only ours, magenta = leak)
+                def rgb(m):
+                    o = np.zeros(m['head'].shape + (4,), np.float32)
+                    o[..., 3] = 1
+                    o[m['head']] = (0.85, 0.3, 0.3, 1)
+                    o[m['armor']] = (0.3, 0.75, 0.35, 1)
+                    o[m['leak']] = (1, 0, 1, 1)
+                    return o
+                diff = np.zeros_like(rgb(mo))
+                diff[..., 3] = 1
+                any_o, any_u = mo['head'] | mo['armor'], mu['head'] | mu['armor']
+                diff[any_o & any_u] = (0.35, 0.35, 0.35, 1)
+                diff[any_o & ~any_u] = (1, 0.1, 0.1, 1)
+                diff[any_u & ~any_o] = (0.1, 1, 0.1, 1)
+                diff[mu['leak']] = (1, 0, 1, 1)
+                strip = np.concatenate([rgb(mo), np.ones((res, 4, 4), np.float32), rgb(mu),
+                                        np.ones((res, 4, 4), np.float32), diff], axis=1)
+                im = bpy.data.images.new('M2A_join', strip.shape[1], strip.shape[0], alpha=True)
+                im.pixels[:] = strip.ravel()
+                im.filepath_raw = os.path.join(d, f'{vname}.png')
+                im.file_format = 'PNG'
+                im.save()
+                bpy.data.images.remove(im)
+                for p in (po, pu):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+    finally:
+        _restore_pose(arm, saved_pose)
+        for n, h in old['hide'].items():
+            if n in scn.objects:
+                scn.objects[n].hide_render = h
+        for n, c in old['color'].items():
+            if n in scn.objects:
+                scn.objects[n].color = c
+        scn.camera = old['cam']
+        scn.render.resolution_x, scn.render.resolution_y = old['x'], old['y']
+        scn.render.resolution_percentage = old['pct']
+        scn.render.filepath = old['path']
+        scn.display.shading.light, scn.display.shading.color_type = old['light'], old['ctype']
+        scn.display.render_aa = old['aa']
+        if old['world'] is not None:
+            scn.world.color = old['world']
+        try:
+            scn.view_settings.view_transform = old['view']
+            scn.render.engine = old['engine']
+        except TypeError:
+            pass
+        bpy.data.objects.remove(cam)
+        bpy.data.cameras.remove(cam_data)
+        me = core.data
+        bpy.data.objects.remove(core)
+        bpy.data.meshes.remove(me)
+    gate_head = seam != 'skin' or summary['head_iou_min'] >= STRICT['head_iou']
+    summary['ok'] = summary['leak_ours'] == 0 and gate_head
+    worst = sorted(results, key=lambda r: (-r['leak_ours'], r['head_iou']))[:8]
+    _table([(r['pose'], r['view'], r['leak_orig'], r['leak_ours'], f"{r['head_iou']:.6f}", f"{r['armor_iou']:.4f}")
+            for r in worst], ('pose', 'view', 'leak orig', 'leak ours', 'head IoU', 'armor IoU'))
+    print(f"head join: {'OK' if summary['ok'] else 'FAIL'}  images {summary['images']}  leak ours "
+          f"{summary['leak_ours']} (orig {summary['leak_orig']})  min head IoU {summary['head_iou_min']:.6f}")
+    return dict(summary=summary, results=results)
+
+
+def head_join_gate(armature, head, orig_armor, our_armor, out_dir, snapshot, seam='skin', **kw):
+    """All head-join checks in one call; ok only when EVERY check passes (100% rule)."""
+    r = dict(locks=lock_check(snapshot, armature, our_armor, seam=seam)['ok'])
+    if seam == 'skin':
+        r['seam'] = strict_seam_report(head, our_armor)['ok']
+        c = seam_color_report(head, our_armor)['ok']
+        r['colour'] = 'skipped: no texture yet' if c is None else c  # must be re-run once textures exist
+    r['render'] = neck_join_compare(armature, head, orig_armor, our_armor, out_dir, seam=seam, **kw)['summary']['ok']
+    r['ok'] = all(r.values())
+    print('HEAD JOIN GATE:', 'PASS' if r['ok'] else 'FAIL', {k: v for k, v in r.items() if k != 'ok'})
+    return r
+
+
+# ---------------------------------------------------------------------------------------------------------- OBJ mode / budget
+def band_report(ref, ours, bands=24, tol=0.01, zrange=None):
+    """Rig-free proportion + drift check (OBJ files have no skeleton). Slices both meshes into horizontal bands and
+    compares width (X), depth (Y) and the band centre. ref = original armor (or naked body)."""
+    ref, ours = _obj(ref), _obj(ours)
+    A, B = _world_verts(ref, evaluated=False), _world_verts(ours, evaluated=False)
+    z0, z1 = zrange or (min(p.z for p in A), max(p.z for p in A))
+    step = (z1 - z0) / bands
+    rows, out, bad = [], [], []
+    for k in range(bands):
+        lo, hi = z0 + k * step, z0 + (k + 1) * step
+        a = [p for p in A if lo <= p.z < hi]
+        b = [p for p in B if lo <= p.z < hi]
+        if not a or not b:
+            continue
+        w = lambda P, i: max(p[i] for p in P) - min(p[i] for p in P)
+        ca, cb = sum(a, Vector()) / len(a), sum(b, Vector()) / len(b)
+        mid = lambda P, i: (max(p[i] for p in P) + min(p[i] for p in P)) * 0.5
+        shift = math.hypot(mid(b, 0) - mid(a, 0), mid(b, 1) - mid(a, 1))
+        rec = dict(z=(lo + hi) / 2, ref_w=w(a, 0), our_w=w(b, 0), ref_d=w(a, 1), our_d=w(b, 1), shift=shift)
+        out.append(rec)
+        if shift > tol:
+            bad.append(round(rec['z'], 4))
+        rows.append((f"{rec['z']:.3f}", f"{rec['ref_w']:.4f}", f"{rec['our_w']:.4f}", f"{rec['our_w'] / rec['ref_w']:.3f}",
+                     f"{rec['ref_d']:.4f}", f"{rec['our_d']:.4f}", f"{rec['our_d'] / rec['ref_d']:.3f}", f'{shift:.4f}',
+                     'OK' if shift <= tol else 'SHIFT'))
+    _table(rows, ('z', 'ref w', 'our w', 'w ratio', 'ref d', 'our d', 'd ratio', 'centre shift', 'status'))
+    print('band report:', 'OK' if not bad else f'SHIFT at z {bad}')
+    return dict(ok=not bad, bands=out, shifted=bad)
+
+
+def budget_report(objs, max_tris=None, max_tex=None, max_mats=None, calibrate=()):
+    """Triangle count, texture sizes and material count of `objs`. calibrate: reference armors (e.g. a recent
+    Metin2 armor the user supplied); their largest values become the limits when no explicit limit is given."""
+    def stats(o):
+        o = _obj(o)
+        me = o.data
+        me.calc_loop_triangles()
+        tex = [n.image.size[:] for s in o.material_slots if s.material and s.material.use_nodes
+               for n in s.material.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image]
+        return dict(name=o.name, tris=len(me.loop_triangles), tex=max((max(t) for t in tex), default=0),
+                    mats=len([s for s in o.material_slots if s.material]))
+    cal = [stats(o) for o in calibrate]
+    if cal:
+        max_tris = max_tris or int(max(c['tris'] for c in cal) * 1.15)
+        max_tex = max_tex or max(c['tex'] for c in cal)
+        max_mats = max_mats or max(c['mats'] for c in cal)
+    rows, ok = [], True
+    for c in cal:
+        rows.append(('calib: ' + c['name'], c['tris'], c['tex'], c['mats'], '-'))
+    tot = dict(tris=0, tex=0, mats=0)
+    for o in objs:
+        s = stats(o)
+        tot['tris'] += s['tris']
+        tot['tex'] = max(tot['tex'], s['tex'])
+        tot['mats'] += s['mats']
+        rows.append((s['name'], s['tris'], s['tex'], s['mats'], ''))
+    st = []
+    if max_tris and tot['tris'] > max_tris:
+        st.append(f"tris {tot['tris']} > {max_tris}")
+    if max_tex and tot['tex'] > max_tex:
+        st.append(f"texture {tot['tex']} > {max_tex}")
+    if max_mats and tot['mats'] > max_mats:
+        st.append(f"materials {tot['mats']} > {max_mats}")
+    ok = not st
+    rows.append(('TOTAL', tot['tris'], tot['tex'], tot['mats'], 'OK' if ok else '; '.join(st)))
+    _table(rows, ('object', 'tris', 'max tex', 'materials', 'status'))
+    print(f'budget: limits tris {max_tris} tex {max_tex} materials {max_mats}')
+    return dict(ok=ok, total=tot, limits=dict(tris=max_tris, tex=max_tex, mats=max_mats), problems=st)

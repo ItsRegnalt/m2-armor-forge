@@ -28,7 +28,11 @@ toolkit, scoring and compare-and-fix loop.
   separately, in bind pose and in every test pose.
 - **Macro loop.** Close-up renders of every region from 8 views in every pose; defects are fixed and re-shot until a
   full pass is clean. Progress collages show the original armor, references and ours side by side.
-- **Textures for the client.** Original texel density and DDS format; diffuse alpha as the specular mask.
+- **Game-ready budget.** Polygon / texture limits calibrated from a recent Metin2 armor; Meshy meshes are rebuilt,
+  never shipped.
+- **Head join at 100%.** Original and new armor are compared with the head side by side from 26 views in every pose
+  (leak test, head mask, seam geometry and colour); the loop runs until every check passes.
+- **Textures for the client.** DDS format of the original; diffuse alpha as the specular mask.
 - **Speaks your language.** Replies follow your operating system's display language.
 
 ## Requirements
@@ -36,8 +40,9 @@ toolkit, scoring and compare-and-fix loop.
 - [Claude Code](https://claude.com/claude-code).
 - Blender 4.2 or newer (tested on 5.2) with a Blender MCP server, e.g. [blender-mcp](https://github.com/ahujasid/blender-mcp).
 - [reference-forge](https://github.com/ItsRegnalt/reference-forge) installed as a skill (comparison scripts, collages).
-- A way to get `.gr2` in and out: the *M2 Granny Tools* Blender extension, or 3ds Max + Granny 2.11 exporter
-  (+ Noesis for `.gr2` → FBX). The skill does not ship or download these.
+- A way to get the game models in and out: your own exporter (OBJ + textures works; a skeleton export enables the rig
+  checks), the *M2 Granny Tools* Blender extension, or 3ds Max + Granny 2.11 exporter (+ Noesis for `.gr2` → FBX).
+  The skill does not ship or download these.
 - Python 3 with Pillow for collages.
 
 ## Installation
