@@ -677,9 +677,11 @@ MACRO_VIEWS = {  # direction the camera looks FROM, relative to the region centr
 DEFAULT_MACRO_REGIONS = ('neck', 'clavicle', 'upperarm', 'forearm', 'hand', 'spine', 'pelvis', 'thigh', 'calf', 'foot')
 
 
-def macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None, res=768, size=0.25, engine=None):
+def macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None, res=768, size=0.25, engine=None,
+                game_view=True):
     """Close-up renders of every region in every pose -> out_dir/<pose>/<bone>_<view>.png.
-    Only `objs` render. size = ortho width (scene units) around the posed bone centre. Restores everything."""
+    Only `objs` render. size = ortho width (scene units) around the posed bone centre. game_view: backface culling
+    on (workbench and material setting), as the client draws. Restores everything."""
     import os
     arm = _obj(armature)
     objs = [_obj(o) for o in objs]
@@ -697,7 +699,13 @@ def macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None, r
     scn.collection.objects.link(cam)
     saved = _save_pose(arm)
     files = []
+    mats = {m for o in objs for s in o.material_slots if (m := s.material)}
+    old_cull = ({m.name: m.use_backface_culling for m in mats}, scn.display.shading.show_backface_culling)
     try:
+        if game_view:
+            for m in mats:
+                m.use_backface_culling = True
+            scn.display.shading.show_backface_culling = True
         if engine:
             try:
                 scn.render.engine = engine
@@ -728,6 +736,9 @@ def macro_shots(armature, objs, out_dir, poses=None, regions=None, views=None, r
                     files.append(p)
     finally:
         _restore_pose(arm, saved)
+        for m in mats:
+            m.use_backface_culling = old_cull[0][m.name]
+        scn.display.shading.show_backface_culling = old_cull[1]
         for n, h in old['hide'].items():
             if n in scn.objects:
                 scn.objects[n].hide_render = h
@@ -870,6 +881,7 @@ def neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None
                path=scn.render.filepath, engine=scn.render.engine, view=scn.view_settings.view_transform,
                hide={o.name: o.hide_render for o in scn.objects}, color={o.name: tuple(o.color) for o in scn.objects},
                light=scn.display.shading.light, ctype=scn.display.shading.color_type,
+               cull=scn.display.shading.show_backface_culling,
                world=scn.world.color[:] if scn.world else None, aa=scn.display.render_aa)
     cam_data = bpy.data.cameras.new('M2A_JoinCam')
     cam_data.type = 'ORTHO'
@@ -905,6 +917,7 @@ def neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None
             print('workbench not available:', e)
         scn.display.shading.light = 'FLAT'
         scn.display.shading.color_type = 'OBJECT'
+        scn.display.shading.show_backface_culling = True  # the client draws front faces only
         scn.display.render_aa = 'OFF'
         scn.world.color = (0, 0, 0)
         try:
@@ -975,6 +988,7 @@ def neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None
         scn.render.resolution_percentage = old['pct']
         scn.render.filepath = old['path']
         scn.display.shading.light, scn.display.shading.color_type = old['light'], old['ctype']
+        scn.display.shading.show_backface_culling = old['cull']
         scn.display.render_aa = old['aa']
         if old['world'] is not None:
             scn.world.color = old['world']
@@ -1218,3 +1232,704 @@ def prepare_inputs(armor_fbx, naked_fbx, head_fbx):
     print('INPUTS READY' if ok else 'INPUTS LOADED, SKELETON MISMATCH: report it before working')
     return dict(ok=ok, slots=rep, armature=A['arm'], body=body, armor=armor, head=head, snapshot=snap,
                 seam=seam, parts=dict(parts), loaded=loaded)
+
+
+# ======================================================================================================== GAME-VIEW QA
+# The client draws front faces only (backface culling) and shows exactly the body part we ship: nothing below the neck
+# may be missing, no hole may show the inside, and the texture must survive mip-mapping.
+
+DEFAULT_POSES.update({
+    'attack_overhead': {'upperarm': (0, 0, 120), 'forearm': (0, 40, 0)},
+    'attack_forward': {'upperarm': (0, 90, 30), 'forearm': (0, 20, 0)},
+})
+
+
+def _bone_region_map(o):
+    """vertex index -> region name (collar, pauldron_L, glove_R ...) from the dominant weight."""
+    out = {}
+    for i, gs in enumerate(_groups_by_vertex(o)):
+        out[i] = _region_of_bone(max(gs, key=lambda x: x[1])[0]) if gs else 'unweighted'
+    return out
+
+
+def coverage_report(orig_armor, ours, naked=None, dist=0.04, min_ratio=0.999, ours_extra=()):
+    """Is the whole body part there? For every region of the ORIGINAL armor (and the naked body below the neck),
+    the share of its vertices that have our surface within `dist`. Missing legs, crotch, arms -> < 100%.
+    ours_extra: more of our objects (separate pieces) that also count as coverage."""
+    tree_objs = [_obj(ours)] + [_obj(o) for o in ours_extra]
+    trees = [_bvh(o, evaluated=False) for o in tree_objs]
+
+    def covered(p):
+        return any((lambda h: h[0] is not None)(t.find_nearest(p, dist)) for t in trees)
+
+    rows, res, bad = [], {}, []
+    srcs = [('original', _obj(orig_armor))] + ([('naked', _obj(naked))] if naked is not None else [])
+    for tag, src in srcs:
+        reg = _bone_region_map(src)
+        vs = _world_verts(src, evaluated=False)
+        nb = neck_border(src) if tag == 'naked' else None
+        acc = defaultdict(lambda: [0, 0])
+        for i, p in enumerate(vs):
+            if nb is not None and p.z > nb[2].z + 0.002:
+                continue  # the head part covers this
+            r = reg.get(i, 'other')
+            acc[r][1] += 1
+            acc[r][0] += covered(p)
+        for r, (c, n) in sorted(acc.items()):
+            ratio = c / n if n else 1
+            ok = ratio >= min_ratio
+            res[(tag, r)] = ratio
+            if not ok:
+                bad.append(f'{tag}:{r}')
+            rows.append((tag, r, n, f'{ratio * 100:.2f}%', 'OK' if ok else 'MISSING'))
+    _table(rows, ('vs', 'region', 'verts', 'covered', 'status'))
+    print('coverage:', 'OK' if not bad else f'MISSING in {bad}')
+    return dict(ok=not bad, ratios=res, missing=bad)
+
+
+def open_edges_report(obj, armature=None):
+    """Open borders of our mesh. In game every open border shows the inside unless another piece hides it in every
+    pose. The neck border is expected; every other loop is listed with its region for the leak test to prove."""
+    o = _obj(obj)
+    arm = _obj(armature) if armature else _armature_of(o)
+    loops = _boundary_loops(o)
+    nb = neck_border(o, arm) if arm else None
+    reg = _bone_region_map(o)
+    rows, others = [], []
+    for idx, pts in loops:
+        c = sum(pts, Vector()) / len(pts)
+        is_neck = nb is not None and set(idx) == set(nb[0])
+        regions = defaultdict(int)
+        for i in idx:
+            regions[reg.get(i, 'other')] += 1
+        r = max(regions, key=regions.get)
+        rows.append(('neck' if is_neck else r, len(idx), f'({c.x:.3f}, {c.y:.3f}, {c.z:.3f})', 'expected' if is_neck else 'CHECK'))
+        if not is_neck:
+            others.append(dict(region=r, verts=len(idx), centre=tuple(c)))
+    _table(rows, ('region', 'border verts', 'centre', 'status'))
+    print(f'open borders: {len(loops)} ({len(others)} besides the neck must be hidden in every pose)')
+    return dict(loops=len(loops), others=others)
+
+
+def flipped_faces_report(obj, body, step=0.002, max_ratio=0.0):
+    """Faces whose normal points towards the body (they vanish in game from outside). Compares the body distance of
+    each face centre with the distance one `step` along the normal."""
+    o, tree = _obj(obj), _bvh(_obj(body), evaluated=False)
+    mw, nm = o.matrix_world, o.matrix_world.to_3x3().inverted().transposed()
+    reg = _bone_region_map(o)
+    flipped = defaultdict(int)
+    n = 0
+    for f in o.data.polygons:
+        c = mw @ f.center
+        nrm = (nm @ f.normal).normalized()
+        d0, d1 = _signed_dist(tree, c), _signed_dist(tree, c + nrm * step)
+        if d0 is None or d1 is None or d0 < 0:
+            continue
+        n += 1
+        if d1 < d0 - step * 0.5:
+            flipped[reg.get(f.vertices[0], 'other')] += 1
+    total = sum(flipped.values())
+    ok = total <= max_ratio * max(1, n)
+    print(f'flipped faces: {"OK" if ok else "PROBLEM"}  {total} of {n} outer faces  by region {dict(flipped)}')
+    return dict(ok=ok, flipped=total, by_region=dict(flipped))
+
+
+def game_leak_test(armature, armor_objs, head, naked, out_dir, poses=None, views=None, res=384, size=None,
+                   shrink=0.003, compare_objs=None):
+    """Whole-body hole test as the game draws it (backface culling ON). A magenta copy of the naked body, shrunk by
+    `shrink` and deformed by the same rig, sits inside the armor: any magenta pixel is a hole, a gap between pieces,
+    a flipped face or a missing region. compare_objs: the original armor (+ head) rendered the same way as baseline.
+    Saves only the images with leaks: out_dir/<pose>/<view>.png."""
+    import os
+    import numpy as np
+    arm = _obj(armature)
+    armor_objs = [_obj(o) for o in armor_objs]
+    head, naked = _obj(head), _obj(naked)
+    poses = poses or DEFAULT_POSES
+    views = views or sphere_views(26)
+    scn = bpy.context.scene
+    saved_pose = _save_pose(arm)
+    _apply_pose(arm, {})
+    core = naked.copy()
+    core.data = naked.data.copy()
+    core.name = 'M2A_BodyCore'
+    scn.collection.objects.link(core)
+    disp = core.modifiers.new('M2A_Shrink', 'DISPLACE')
+    disp.strength = -shrink
+    disp.mid_level = 0.0  # no texture: offset = -shrink along normals
+    core.modifiers.move(core.modifiers.find(disp.name), 0)  # shrink in rest space, then the armature deforms it
+    vs = _world_verts(naked, evaluated=False)
+    lo = Vector((min(p.x for p in vs), min(p.y for p in vs), min(p.z for p in vs)))
+    hi = Vector((max(p.x for p in vs), max(p.y for p in vs), max(p.z for p in vs)))
+    size = size or max(hi - lo) * 1.3
+    cam_data = bpy.data.cameras.new('M2A_LeakCam')
+    cam_data.type = 'ORTHO'
+    cam_data.ortho_scale = size
+    cam_data.clip_start, cam_data.clip_end = 0.001, size * 20
+    cam = bpy.data.objects.new('M2A_LeakCam', cam_data)
+    scn.collection.objects.link(cam)
+    sh = scn.display.shading
+    old = dict(cam=scn.camera, x=scn.render.resolution_x, y=scn.render.resolution_y, pct=scn.render.resolution_percentage,
+               path=scn.render.filepath, engine=scn.render.engine, view=scn.view_settings.view_transform,
+               hide={o.name: o.hide_render for o in scn.objects}, color={o.name: tuple(o.color) for o in scn.objects},
+               light=sh.light, ctype=sh.color_type, cull=sh.show_backface_culling, aa=scn.display.render_aa,
+               world=scn.world.color[:] if scn.world else None)
+    if not scn.world:
+        scn.world = bpy.data.worlds.new('M2A_World')
+    results, summary = [], dict(ours=0, base=0, images=0, leaky=[])
+
+    def shoot(objs, path):
+        names = {o.name for o in objs} | {core.name}
+        for o in scn.objects:
+            if o.type in ('MESH', 'CURVE'):
+                o.hide_render = o.name not in names
+        scn.render.filepath = path
+        bpy.ops.render.render(write_still=True)
+        img = bpy.data.images.load(path, check_existing=False)
+        w, h = img.size
+        a = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, img.channels)[..., :3]
+        bpy.data.images.remove(img)
+        return (a[..., 0] > 0.5) & (a[..., 1] < 0.5) & (a[..., 2] > 0.5)
+
+    try:
+        try:
+            scn.render.engine = 'BLENDER_WORKBENCH'
+        except TypeError as e:
+            print('workbench not available:', e)
+        sh.light, sh.color_type, sh.show_backface_culling = 'FLAT', 'OBJECT', True
+        scn.display.render_aa = 'OFF'
+        scn.world.color = (0, 0, 0)
+        try:
+            scn.view_settings.view_transform = 'Standard'
+        except TypeError:
+            pass
+        for o in armor_objs + [head] + list(compare_objs or []):
+            o.color = (0.6, 0.6, 0.6, 1)
+        core.color = (1, 0, 1, 1)
+        scn.camera = cam
+        scn.render.resolution_x = scn.render.resolution_y = res
+        scn.render.resolution_percentage = 100
+        for pname, spec in poses.items():
+            _apply_pose(arm, spec)
+            c = (lo + hi) * 0.5
+            d = os.path.join(out_dir, pname)
+            os.makedirs(d, exist_ok=True)
+            for vname, dirv in views.items():
+                dv = Vector(dirv).normalized()
+                cam.location = c + dv * (size * 5)
+                cam.rotation_euler = (-dv).to_track_quat('-Z', 'Y' if abs(dv.z) > 0.9 else 'Z').to_euler()
+                p = os.path.join(d, f'{vname}.png')
+                m_ours = shoot(armor_objs + [head], p)
+                n_ours = int(m_ours.sum())
+                n_base = 0
+                if compare_objs:
+                    pb = os.path.join(d, f'_base_{vname}.png')
+                    n_base = int(shoot(list(compare_objs) + [head], pb).sum())
+                    try:
+                        os.remove(pb)
+                    except OSError:
+                        pass
+                if n_ours == 0:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                else:
+                    summary['leaky'].append(f'{pname}/{vname}')
+                results.append(dict(pose=pname, view=vname, leak=n_ours, base=n_base))
+                summary['ours'] += n_ours
+                summary['base'] += n_base
+                summary['images'] += 1
+    finally:
+        _restore_pose(arm, saved_pose)
+        for n, h in old['hide'].items():
+            if n in scn.objects:
+                scn.objects[n].hide_render = h
+        for n, col in old['color'].items():
+            if n in scn.objects:
+                scn.objects[n].color = col
+        scn.camera = old['cam']
+        scn.render.resolution_x, scn.render.resolution_y = old['x'], old['y']
+        scn.render.resolution_percentage = old['pct']
+        scn.render.filepath = old['path']
+        sh.light, sh.color_type, sh.show_backface_culling = old['light'], old['ctype'], old['cull']
+        scn.display.render_aa = old['aa']
+        if old['world'] is not None:
+            scn.world.color = old['world']
+        try:
+            scn.view_settings.view_transform = old['view']
+            scn.render.engine = old['engine']
+        except TypeError:
+            pass
+        bpy.data.objects.remove(cam)
+        bpy.data.cameras.remove(cam_data)
+        me = core.data
+        bpy.data.objects.remove(core)
+        bpy.data.meshes.remove(me)
+    summary['ok'] = summary['ours'] == 0
+    worst = sorted(results, key=lambda r: -r['leak'])[:8]
+    _table([(r['pose'], r['view'], r['leak'], r['base']) for r in worst], ('pose', 'view', 'leak px ours', 'leak px original'))
+    print(f"game leak test: {'OK' if summary['ok'] else 'HOLES'}  images {summary['images']}  leak px {summary['ours']} "
+          f"(original {summary['base']})")
+    return dict(summary=summary, results=results)
+
+
+# ---------------------------------------------------------------------------------------------------------- triangles
+def tri_quality_report(obj, min_angle=6.0, max_aspect=15.0):
+    """Slivers and spikes: triangles with a tiny angle or extreme aspect ratio (jagged, broken-looking edges)."""
+    o = _obj(obj)
+    reg = _bone_region_map(o)
+    me = o.data
+    me.calc_loop_triangles()
+    mw = o.matrix_world
+    bad = defaultdict(int)
+    planar = set()  # triangles of flat n-gons are just the fan of a flat cap: not a visible spike
+    for f in me.polygons:
+        if len(f.vertices) > 4:
+            c, n = f.center, f.normal
+            if max(abs((me.vertices[i].co - c).dot(n)) for i in f.vertices) < 1e-5 + 1e-4 * math.sqrt(f.area):
+                planar.add(f.index)
+    for t in me.loop_triangles:
+        if t.polygon_index in planar:
+            continue
+        p = [mw @ me.vertices[i].co for i in t.vertices]
+        e = [(p[1] - p[0]).length, (p[2] - p[1]).length, (p[0] - p[2]).length]
+        if min(e) < 1e-9:
+            bad[reg.get(t.vertices[0], 'other')] += 1
+            continue
+        angs = [math.degrees((p[(k + 1) % 3] - p[k]).angle(p[(k + 2) % 3] - p[k], 0)) for k in range(3)]
+        area = ((p[1] - p[0]).cross(p[2] - p[0])).length * 0.5
+        aspect = max(e) ** 2 / (2 * area) if area > 1e-12 else 1e9
+        if min(angs) < min_angle or aspect > max_aspect:
+            bad[reg.get(t.vertices[0], 'other')] += 1
+    total = sum(bad.values())
+    print(f'triangle quality: {"OK" if not total else "PROBLEM"}  {total} slivers / spikes  by region {dict(bad)}')
+    return dict(ok=not total, bad=total, by_region=dict(bad))
+
+
+# ---------------------------------------------------------------------------------------------------------- UV / texture
+def _uv_islands(o):
+    """face index -> island id (faces joined by edges whose UVs match on both ends)."""
+    me = o.data
+    uv = me.uv_layers.active.data
+    parent = list(range(len(me.polygons)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    edge_loops = defaultdict(list)  # (v1, v2) -> [(face, uv1, uv2)]
+    for f in me.polygons:
+        li = list(f.loop_indices)
+        for k in range(len(li)):
+            a, b = li[k], li[(k + 1) % len(li)]
+            va, vb = me.loops[a].vertex_index, me.loops[b].vertex_index
+            key = (va, vb) if va < vb else (vb, va)
+            ua, ub = tuple(uv[a].uv), tuple(uv[b].uv)
+            if va > vb:
+                ua, ub = ub, ua
+            edge_loops[key].append((f.index, ua, ub))
+    seams = []
+    for key, L in edge_loops.items():
+        if len(L) != 2:
+            continue
+        (f1, a1, b1), (f2, a2, b2) = L
+        same = max(abs(a1[0] - a2[0]), abs(a1[1] - a2[1]), abs(b1[0] - b2[0]), abs(b1[1] - b2[1])) < 1e-5
+        if same:
+            parent[find(f1)] = find(f2)
+        else:
+            seams.append((key, L))
+    return [find(i) for i in range(len(me.polygons))], seams
+
+
+def _raster_islands(o, res):
+    """Label image (island id + 1, 0 = empty) and overlap count image at res x res."""
+    import numpy as np
+    me = o.data
+    uv = me.uv_layers.active.data
+    isl, _ = _uv_islands(o)
+    lab = np.zeros((res, res), np.int32)
+    cnt = np.zeros((res, res), np.int32)
+    ids = {k: n + 1 for n, k in enumerate(sorted(set(isl)))}
+    for f in me.polygons:
+        li = list(f.loop_indices)
+        pts = [np.array(uv[l].uv) * res for l in li]
+        for k in range(1, len(pts) - 1):
+            a, b, c = pts[0], pts[k], pts[k + 1]
+            x0, x1 = int(max(0, min(a[0], b[0], c[0]))), int(min(res - 1, max(a[0], b[0], c[0])))
+            y0, y1 = int(max(0, min(a[1], b[1], c[1]))), int(min(res - 1, max(a[1], b[1], c[1])))
+            if x1 < x0 or y1 < y0:
+                continue
+            X, Y = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(d) < 1e-12:
+                continue
+            l1 = ((b[1] - c[1]) * (X - c[0]) + (c[0] - b[0]) * (Y - c[1])) / d
+            l2 = ((c[1] - a[1]) * (X - c[0]) + (a[0] - c[0]) * (Y - c[1])) / d
+            m = (l1 >= 0) & (l2 >= 0) & (l1 + l2 <= 1)
+            sub_l, sub_c = lab[y0:y1 + 1, x0:x1 + 1], cnt[y0:y1 + 1, x0:x1 + 1]
+            iid = ids[isl[f.index]]
+            other = m & (sub_l != 0) & (sub_l != iid)
+            sub_c[other] += 1
+            sub_l[m] = iid
+    return lab, cnt
+
+
+def _dilate(mask, r):
+    import numpy as np
+    out = mask.copy()
+    for _ in range(r):
+        n = out.copy()
+        n[1:] |= out[:-1]
+        n[:-1] |= out[1:]
+        n[:, 1:] |= out[:, :-1]
+        n[:, :-1] |= out[:, 1:]
+        out = n
+    return out
+
+
+def uv_report(obj, tex_size=1024, padding_px=8, res=512):
+    """UV checks for the game: overlaps between islands, islands closer than 2 x padding (they bleed into each other
+    at lower mip levels), UVs outside 0-1, texel density spread."""
+    import numpy as np
+    o = _obj(obj)
+    if not o.data.uv_layers:
+        print('uv: NO UV MAP')
+        return dict(ok=False, reason='no uv')
+    me = o.data
+    uv = me.uv_layers.active.data
+    out_of_range = sum(1 for l in uv if not (0 <= l.uv[0] <= 1 and 0 <= l.uv[1] <= 1))
+    lab, cnt = _raster_islands(o, res)
+    overlap_px = int((cnt > 0).sum())
+    pad = max(1, round(padding_px * res / tex_size))
+    close_px = 0
+    ids = [i for i in np.unique(lab) if i]
+    grown = {i: _dilate(lab == i, pad) for i in ids} if len(ids) < 400 else {}
+    if grown:
+        acc = np.zeros(lab.shape, np.int32)
+        for g in grown.values():
+            acc += g
+        close_px = int((acc > 1).sum())
+    # texel density per face: px per scene unit
+    mw = o.matrix_world
+    dens = []
+    for f in me.polygons:
+        li = list(f.loop_indices)
+        a3 = f.area * (mw.to_3x3().determinant() ** (2 / 3))
+        auv = 0.0
+        P = [uv[l].uv for l in li]
+        for k in range(1, len(P) - 1):
+            auv += abs((P[k][0] - P[0][0]) * (P[k + 1][1] - P[0][1]) - (P[k + 1][0] - P[0][0]) * (P[k][1] - P[0][1])) * 0.5
+        if a3 > 1e-10 and auv > 1e-12:
+            dens.append(math.sqrt(auv / a3) * tex_size)
+    dens.sort()
+    med = dens[len(dens) // 2] if dens else 0
+    spread = (dens[int(len(dens) * 0.95)] / max(1e-9, dens[int(len(dens) * 0.05)])) if dens else 0
+    ok = out_of_range == 0 and overlap_px == 0 and close_px == 0 and spread < 3
+    print(f'uv: {"OK" if ok else "PROBLEM"}  islands {len(ids)}  overlap px {overlap_px}  too-close px {close_px} '
+          f'(padding {padding_px}px @ {tex_size})  outside 0-1 {out_of_range}  texel density median {med:.0f} px/unit, '
+          f'5-95% spread x{spread:.2f}')
+    return dict(ok=ok, islands=len(ids), overlap_px=overlap_px, close_px=close_px, outside=out_of_range,
+                density_median=med, density_spread=spread)
+
+
+def _image_array(img):
+    import numpy as np
+    w, h = img.size
+    return np.array(img.pixels[:], dtype=np.float32).reshape(h, w, img.channels)
+
+
+def padding_report(obj, image=None, padding_px=8, max_de=4.0):
+    """Edge padding (dilation): the pixels just outside every island must repeat the island's border colour, or the
+    gutter colour bleeds in at lower mip levels (red / gold smears). Checks the ring of `padding_px` around islands."""
+    import numpy as np
+    o = _obj(obj)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(o))
+    if img is None:
+        print('padding: no texture')
+        return dict(ok=None)
+    px = _image_array(img)[..., :3]
+    h, w = px.shape[:2]
+    lab, _ = _raster_islands(o, w)
+    inside = lab > 0
+    # propagate island colours outward and compare with what is in the texture
+    col = np.where(inside[..., None], px, 0)
+    have = inside.copy()
+    for _ in range(padding_px):
+        n_have = _dilate(have, 1) & ~have
+        acc = np.zeros_like(col)
+        num = np.zeros(have.shape, np.float32)
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            sh_have = np.roll(have, (dy, dx), (0, 1))
+            sh_col = np.roll(col, (dy, dx), (0, 1))
+            acc += np.where(sh_have[..., None], sh_col, 0)
+            num += sh_have
+        fill = n_have & (num > 0)
+        col[fill] = acc[fill] / num[fill][:, None]
+        have |= fill
+    ring = have & ~inside
+    if not ring.any():
+        return dict(ok=True, ring=0)
+    diff = np.abs(col[ring] - px[ring]).max(axis=1) * 100  # rough delta in % of range
+    bad = int((diff > max_de).sum())
+    ratio = bad / ring.sum()
+    ok = ratio < 0.02
+    print(f'padding: {"OK" if ok else "PROBLEM"}  ring px {int(ring.sum())}  not padded {bad} ({ratio * 100:.1f}%)')
+    return dict(ok=ok, ring=int(ring.sum()), not_padded=bad, ratio=ratio)
+
+
+def seam_continuity_report(obj, image=None, max_de=8.0, worst=10):
+    """Texture continuity across UV seams: samples both sides of every seam edge (nudged into each island) and
+    reports delta E. Broken gold trims, colour jumps at the back of the belt show up here."""
+    import numpy as np
+    o = _obj(obj)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(o))
+    if img is None or not o.data.uv_layers:
+        print('seam continuity: no texture / uv')
+        return dict(ok=None)
+    px = _image_array(img)[..., :3]
+    h, w = px.shape[:2]
+    me = o.data
+    uv = me.uv_layers.active.data
+    _, seams = _uv_islands(o)
+    reg = _bone_region_map(o)
+    mw = o.matrix_world
+
+    def face_uv_centre(fi):
+        li = me.polygons[fi].loop_indices
+        return Vector((sum(uv[l].uv[0] for l in li) / len(li), sum(uv[l].uv[1] for l in li) / len(li)))
+
+    def sample(p):
+        x = min(w - 1, max(0, int(p[0] * w)))
+        y = min(h - 1, max(0, int(p[1] * h)))
+        return px[y, x]
+    res = []
+    for (va, vb), L in seams:
+        cols = []
+        for fi, ua, ub in L:
+            mid = (Vector(ua) + Vector(ub)) * 0.5
+            c = face_uv_centre(fi)
+            dirv = (c - mid)
+            step = 2.0 / w
+            p = mid + (dirv.normalized() * step if dirv.length > 1e-9 else Vector((0, 0)))
+            cols.append(sample(p))
+        de = math.dist(_srgb_to_lab(cols[0]), _srgb_to_lab(cols[1]))
+        pos = mw @ ((me.vertices[va].co + me.vertices[vb].co) * 0.5)
+        res.append((de, reg.get(va, 'other'), tuple(round(x, 3) for x in pos)))
+    res.sort(key=lambda r: -r[0])
+    bad = [r for r in res if r[0] > max_de]
+    _table([(f'{d:.1f}', r, str(p)) for d, r, p in res[:worst]], ('delta E', 'region', 'position'))
+    by_region = defaultdict(int)
+    for _, r, _ in bad:
+        by_region[r] += 1
+    print(f'seam continuity: {"OK" if not bad else "PROBLEM"}  seam edges {len(res)}  above dE {max_de}: {len(bad)}  '
+          f'by region {dict(by_region)}')
+    return dict(ok=not bad, edges=len(res), bad=len(bad), by_region=dict(by_region))
+
+
+# ---------------------------------------------------------------------------------------------------------- design elements
+ELEMENT_ATTR = 'm2_element'
+
+
+def set_element(obj, faces, name):
+    """Tag faces with a design element (skin, chest_plate_blue, gold_trim, red_skirt, tiger_knee ...). The element
+    list is stored on the object; the face attribute holds the index."""
+    import json
+    o = _obj(obj)
+    names = json.loads(o.get('m2_elements', '[]'))
+    if name not in names:
+        names.append(name)
+    o['m2_elements'] = json.dumps(names)
+    me = o.data
+    a = me.attributes.get(ELEMENT_ATTR) or me.attributes.new(ELEMENT_ATTR, 'INT', 'FACE')
+    k = names.index(name)
+    for f in faces:
+        a.data[f if isinstance(f, int) else f.index].value = k
+    return k
+
+
+def elements_from_vertex_groups(obj, mapping):
+    """mapping {element_name: vertex_group_name}: faces whose verts are all in the group get the element."""
+    o = _obj(obj)
+    gv = _groups_by_vertex(o)
+    for el, g in mapping.items():
+        faces = [f.index for f in o.data.polygons if all(any(n == g and w > 0.5 for n, w in gv[v]) for v in f.vertices)]
+        set_element(o, faces, el)
+
+
+def element_color_report(obj, targets, skin='skin', image=None, max_de=12.0, skin_de=10.0):
+    """Painting vs the design: per element, the median texture colour (sampled at each face's UV centre) against
+    the target colour read from the references (hex). Also flags faces of non-skin elements painted skin-coloured
+    and skin faces painted something else."""
+    import json
+    import numpy as np
+    o = _obj(obj)
+    names = json.loads(o.get('m2_elements', '[]'))
+    a = o.data.attributes.get(ELEMENT_ATTR)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(o))
+    if not names or a is None or img is None or not o.data.uv_layers:
+        print('element colours: elements / texture / uv missing')
+        return dict(ok=None)
+    px = _image_array(img)[..., :3]
+    h, w = px.shape[:2]
+    uv = o.data.uv_layers.active.data
+    hex2 = lambda s: tuple(int(s.lstrip('#')[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    per = defaultdict(list)
+    for f in o.data.polygons:
+        li = f.loop_indices
+        u = sum(uv[l].uv[0] for l in li) / len(li)
+        v = sum(uv[l].uv[1] for l in li) / len(li)
+        per[names[a.data[f.index].value]].append(px[min(h - 1, max(0, int(v * h))), min(w - 1, max(0, int(u * w)))])
+    skin_lab = _srgb_to_lab(hex2(targets[skin])) if skin in targets else None
+    rows, bad = [], []
+    for el, cols in sorted(per.items()):
+        med = np.median(np.array(cols), axis=0)
+        de = math.dist(_srgb_to_lab(med), _srgb_to_lab(hex2(targets[el]))) if el in targets else None
+        off = sum(1 for c in cols if el in targets and math.dist(_srgb_to_lab(c), _srgb_to_lab(hex2(targets[el]))) > max_de * 2)
+        skinlike = 0
+        if skin_lab and el != skin:
+            skinlike = sum(1 for c in cols if math.dist(_srgb_to_lab(c), skin_lab) < skin_de)
+        ok = (de is None or de <= max_de) and skinlike == 0 and off <= len(cols) * 0.05
+        if not ok:
+            bad.append(el)
+        rows.append((el, len(cols), '#%02x%02x%02x' % tuple(int(x * 255) for x in med), targets.get(el, '-'),
+                     '-' if de is None else f'{de:.1f}', off, skinlike, 'OK' if ok else 'PROBLEM'))
+    _table(rows, ('element', 'faces', 'painted', 'target', 'dE', 'off faces', 'skin-coloured', 'status'))
+    print('element colours:', 'OK' if not bad else f'PROBLEM in {bad}')
+    return dict(ok=not bad, problems=bad)
+
+
+# ---------------------------------------------------------------------------------------------------------- skin tone
+def _lab_np(rgb):
+    """sRGB (0-1, ... x 3) -> CIE Lab (D65), vectorised."""
+    import numpy as np
+    c = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    M = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
+    xyz = c @ M.T / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+
+def _rgb_np(lab):
+    import numpy as np
+    fy = (lab[..., 0] + 16) / 116
+    fx, fz = fy + lab[..., 1] / 500, fy - lab[..., 2] / 200
+    inv = lambda t: np.where(t ** 3 > 0.008856, t ** 3, (t - 16 / 116) / 7.787)
+    xyz = np.stack([inv(fx) * 0.95047, inv(fy), inv(fz) * 1.08883], -1)
+    Mi = np.linalg.inv(np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]))
+    c = np.clip(xyz @ Mi.T, 0, 1)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * c ** (1 / 2.4) - 0.055)
+
+
+def _raster_faces(o, faces, w, h):
+    """Bool mask (h x w) of the UV area covered by `faces`."""
+    import numpy as np
+    uv = o.data.uv_layers.active.data
+    mask = np.zeros((h, w), bool)
+    for fi in faces:
+        li = list(o.data.polygons[fi].loop_indices)
+        pts = [np.array((uv[l].uv[0] * w, uv[l].uv[1] * h)) for l in li]
+        for k in range(1, len(pts) - 1):
+            a, b, c = pts[0], pts[k], pts[k + 1]
+            x0, x1 = int(max(0, min(a[0], b[0], c[0]))), int(min(w - 1, max(a[0], b[0], c[0])))
+            y0, y1 = int(max(0, min(a[1], b[1], c[1]))), int(min(h - 1, max(a[1], b[1], c[1])))
+            if x1 < x0 or y1 < y0:
+                continue
+            X, Y = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(d) < 1e-12:
+                continue
+            l1 = ((b[1] - c[1]) * (X - c[0]) + (c[0] - b[0]) * (Y - c[1])) / d
+            l2 = ((c[1] - a[1]) * (X - c[0]) + (a[0] - c[0]) * (Y - c[1])) / d
+            mask[y0:y1 + 1, x0:x1 + 1] |= (l1 >= -0.01) & (l2 >= -0.01) & (l1 + l2 <= 1.01)
+    return mask
+
+
+def _element_faces(o, name):
+    import json
+    names = json.loads(o.get('m2_elements', '[]'))
+    a = o.data.attributes.get(ELEMENT_ATTR)
+    if name not in names or a is None:
+        return []
+    k = names.index(name)
+    return [f.index for f in o.data.polygons if a.data[f.index].value == k]
+
+
+def head_skin_reference(head, band=0.05, image=None):
+    """Lab pixels of the head part's skin just above the neck border (the colour every body skin must match)."""
+    import numpy as np
+    head = _obj(head)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(head))
+    nb = neck_border(head)
+    if img is None or nb is None or not head.data.uv_layers:
+        return None
+    mw = head.matrix_world
+    faces = [f.index for f in head.data.polygons if 0 <= (mw @ f.center).z - nb[2].z <= band]
+    px = _image_array(img)
+    h, w = px.shape[:2]
+    m = _raster_faces(head, faces, w, h)
+    return _lab_np(px[..., :3][m]) if m.any() else None
+
+
+def skin_tone_report(head, ours, skin='skin', image=None, max_de=2.0, region_de=3.0):
+    """Body skin vs head skin: overall median delta E (<= max_de) and per body region (<= region_de), so no
+    'tanned head on a pale body' and no patchy arms / legs."""
+    import numpy as np
+    o = _obj(ours)
+    ref = head_skin_reference(head)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(o))
+    faces = _element_faces(o, skin)
+    if ref is None or img is None or not faces:
+        print('skin tone: head texture / skin element / our texture missing')
+        return dict(ok=None)
+    px = _image_array(img)
+    h, w = px.shape[:2]
+    href = np.median(ref, axis=0)
+    reg = _bone_region_map(o)
+    by = defaultdict(list)
+    for fi in faces:
+        by[reg.get(o.data.polygons[fi].vertices[0], 'other')].append(fi)
+    rows, bad, allpx = [], [], []
+    for r, fs in sorted(by.items()):
+        m = _raster_faces(o, fs, w, h)
+        if not m.any():
+            continue
+        lab = _lab_np(px[..., :3][m])
+        allpx.append(lab)
+        de = float(np.linalg.norm(np.median(lab, axis=0) - href))
+        if de > region_de:
+            bad.append(r)
+        rows.append((r, int(m.sum()), f'{de:.2f}', 'OK' if de <= region_de else 'MISMATCH'))
+    total = float(np.linalg.norm(np.median(np.concatenate(allpx), axis=0) - href)) if allpx else 99
+    ok = total <= max_de and not bad
+    _table(rows, ('region', 'skin px', 'dE vs head', 'status'))
+    print(f'skin tone: {"OK" if ok else "MISMATCH"}  overall dE {total:.2f} (limit {max_de})  head Lab {np.round(href, 1)}')
+    return dict(ok=ok, delta_e=total, regions_bad=bad)
+
+
+def match_skin_tone(head, ours, skin='skin', image=None, strength=1.0):
+    """Recolours ONLY our skin texels to the head's skin: per-channel Lab mean / spread transfer, keeps shading detail
+    and the texture's alpha (specular mask). Saves nothing: call image.save() after checking skin_tone_report."""
+    import numpy as np
+    o = _obj(ours)
+    ref = head_skin_reference(head)
+    img = bpy.data.images[image] if isinstance(image, str) else (image or _first_image(o))
+    faces = _element_faces(o, skin)
+    if ref is None or img is None or not faces:
+        print('match skin: head texture / skin element / our texture missing')
+        return dict(ok=False)
+    px = _image_array(img).copy()
+    h, w = px.shape[:2]
+    m = _raster_faces(o, faces, w, h)
+    m = _dilate(m, 2)  # include the padding ring so mip levels stay clean
+    lab = _lab_np(px[..., :3][m])
+    mu_o, sd_o = lab.mean(0), lab.std(0) + 1e-6
+    mu_h, sd_h = ref.mean(0), ref.std(0) + 1e-6
+    new = (lab - mu_o) / sd_o * sd_h + mu_h
+    new = lab + (new - lab) * strength
+    px[..., :3][m] = _rgb_np(new)
+    img.pixels[:] = px.ravel()
+    img.update()
+    print(f'match skin: {int(m.sum())} texels  Lab mean {np.round(mu_o, 1)} -> {np.round(mu_h, 1)}')
+    return dict(ok=True, texels=int(m.sum()))

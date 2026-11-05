@@ -23,6 +23,10 @@ and continue with this file and `scripts/m2a_checks.py` only.
    (`region_shift_report(original_armor, ours)`). A chest pushed forward, a shoulder pushed up or a waist moved
    off-centre is a failure even when the skeleton is untouched.
 4. **Body proportions** (§4).
+5. **Complete body part.** The armor IS the whole body below the neck in game: torso, both arms, hands, crotch,
+   both legs, feet. Whatever is missing or deleted in our mesh is an empty hole in game. Every region the original
+   armor covers must be covered by ours (`coverage_report` = 100%, §7e). Skin that the design shows stays as skin
+   geometry; it is never left out.
 
 `m2a_checks.lock_snapshot(armature, body)` records these values at the start (from the original); every round
 `m2a_checks.lock_check(snapshot, armature, armor)` must return `LOCKS OK` and `region_shift_report` must say `OK`. Any difference is fixed before any other
@@ -70,6 +74,10 @@ client and files; clients differ.
 - **Units / axes.** 3ds Max-origin data: centimetres, Z up. Through Noesis / FBX, wrong unit or up-axis settings are the
   most common cause of broken exports (`-fbxzup`, scale 100). Keep a copy of the original in its native scale and
   compare bounds after every round trip.
+- **The client draws front faces only (backface culling).** Blender draws both sides by default, so holes, deleted
+  hidden skin, open piece edges and flipped normals look fine in Blender and are see-through in game. Every check
+  and review render of this skill runs with backface culling on (`game_view`); a default Blender render is never
+  proof.
 - **Textures.** Diffuse **alpha is the specular mask, not transparency.** Cut-outs (fur fringe, chain gaps, cloth
   tears) need the material's opacity map / alpha-test setup used by the original. Texture paths are written as
   `d:\ymir work\...`. Texture size follows the budget (§5b); keep the original's DDS compression type.
@@ -191,9 +199,12 @@ The armor may have more polygons and larger textures than the original, but it m
 
 Production order:
 
-1. **Base layer from the body.** Duplicate the naked body below the neck border, delete hidden skin, shrink-wrap /
-   offset it outward by the layer thickness. This keeps body proportions and topology flow, and its weights come
-   straight from the body.
+1. **Base layer from the body.** Duplicate the naked body below the neck border (all of it: arms, hands, crotch,
+   legs, feet) and offset it outward by the layer thickness where the design has armor; where the design shows skin,
+   keep the naked body's own skin faces, UVs and weights. This keeps body proportions and topology flow.
+   **Never delete hidden skin by eye.** Skin under a piece may be removed only when `game_leak_test` proves it is
+   covered in every pose (attack poses included); skin under pauldrons, at the armpit, elbow, knee, waist and
+   crotch stays.
 2. **Neck border first.** Lock the neck border loop to the naked body's border (positions, normals, weights, UV skin
    colour) before anything else: run `m2a_checks.neck_seam_report()`. For a covering join, model the collar now and
    test it against the head part in the extreme head poses.
@@ -227,7 +238,7 @@ Production order:
 (body vertices outside the armor where the armor should cover them) and stretched faces:
 
 `bind`, `arms_up`, `arms_down`, `arms_forward`, `elbow_bent`, `torso_twist`, `leg_forward`, `leg_back`, `squat`,
-`head_turn` (covering joins).
+`head_turn` (covering joins), `attack_overhead`, `attack_forward`.
 
 Use the game's own animations (wait, run, attack, skill poses) as well when the user's tools can import them.
 Acceptance: poke-through ≤ 0.5% of covered body vertices in any pose and none at the neck; no face stretched beyond
@@ -293,6 +304,38 @@ border, copy the original's neck topology and weights, re-bake the skin colour),
 original itself fails a check (e.g. it leaks in one view), ours must still pass; report the original's result too.
 Post a join collage each round: rows = worst views / poses, columns = Original, Ours, Difference.
 
+## 7e. Game-view gate (what the client will really show)
+
+Runs after the build, after weights, after painting and before delivery. All of it with backface culling on.
+
+| Check | Tool | Pass condition |
+|---|---|---|
+| Whole body there | `coverage_report(orig_armor, ours, naked, ours_extra=pieces)` | every region of the original armor and of the naked body below the neck 100% covered (no missing arms, legs, crotch, feet) |
+| Open borders | `open_edges_report(ours)` | only the neck border, or borders the leak test proves hidden in every pose |
+| Flipped faces | `flipped_faces_report(ours, naked)` | 0 outer faces pointing into the body |
+| Holes / see-through | `game_leak_test(armature, pieces, head, naked, out_dir, compare_objs=[orig_armor])` | 0 magenta pixels, 26 views x all poses incl. `attack_overhead`, `attack_forward` |
+| Spikes / broken edges | `tri_quality_report(ours)` | no slivers / spikes (knee guard, trim edges) |
+| Pieces vs head | `pose_clip_test(armature, pieces + [head], body)` | no piece crosses the face / head in any pose (pauldron in front of the face on attack = fail) |
+| Same as the original | full-body game-view renders (`macro_shots(..., regions=('spine',), size=<body height x 1.2>)`) | side by side with the original armor from 8 views: every limb present, same silhouette class |
+
+The loop is the same as §7c: fix, re-run all checks, re-shoot, repeat until all pass. A failing check is never
+accepted.
+
+### Known failure catalogue (from play tests)
+
+| Symptom in game | Cause | Check that catches it | Fix |
+|---|---|---|---|
+| Legs / crotch / arms missing in game | Body parts deleted or never built | `coverage_report`, `game_leak_test` | Rebuild from the naked body base; never leave a region empty |
+| Hole between pauldron and upper arm, inside visible | Hidden skin under the pauldron deleted; piece edge open | `game_leak_test` (arms up / down / attack), `open_edges_report` | Restore the skin, close or extend the piece edge under its neighbour |
+| Back of the arm torn | Flipped or missing faces | `flipped_faces_report`, `game_leak_test` back views | Recalculate normals outward, rebuild faces |
+| Pauldron underside open, big flat yellow face from behind | Single-sided shell without an inner face / thickness | `game_leak_test` bottom and back views, macro bottom view | Give the piece thickness or a closed underside painted dark |
+| Belt / hip back edges broken, gold trim in pieces | UV seams cut the trim, trim islands not continuous | `seam_continuity_report`, macro back views | Re-UV the trim as one straight strip (or mirrored), repaint across the seam |
+| Red / gold smears in the trousers when the skirt moves | Too little UV padding (bleed at mip levels); skirt colours painted onto trouser islands | `uv_report` (too-close px), `padding_report`, `element_color_report` | Re-pack with at least 2 x padding, dilate every island, paint per element mask |
+| Blue cracks over skin on the chest | Z-fighting / poke-through between layers, or texture bleed | `part_clip_report`, `poke_through`, `padding_report` | Layer gap of at least 1 mm, push the plate out, fix padding |
+| Knee guard (tiger head) edges sharp and broken | Slivers / spikes, jagged alpha | `tri_quality_report`, macro knee views | Clean topology, bevel the edge, no alpha cut-out on hard edges |
+| Pauldron in front of the face in the attack pose | Pauldron weighted fully to the upper arm, too tall | `pose_clip_test(... + [head])` attack poses | Lower / reshape the pauldron, split plates, partial clavicle weight |
+| Body skin darker / redder than the head (tanned neck) | Skin repainted by hand instead of copied from the game textures | `skin_tone_report` | Copy the naked body skin, `match_skin_tone` to the head |
+
 ## 8. Scoring (adapted)
 
 Same 90/100 working score as reference-forge, with Metin2 weights:
@@ -305,23 +348,51 @@ Same 90/100 working score as reference-forge, with Metin2 weights:
 | Game structure | 15 | Neck seam, part split like original, budget, UV density |
 | Texture and material | 10 | Palette, specular alpha, texel density, DDS settings |
 
-Fit and proportion, locks (skeleton, head, region drift), part clipping and the head-join gate (§7d, 100%) are **gates**: any failure there blocks delivery whatever the total.
+Fit and proportion, locks (skeleton, head, region drift), part clipping, the head-join gate (§7d, 100%), the
+game-view gate (§7e) and the painting gate (§9) are **gates**: any failure there blocks delivery whatever the total.
 
-## 9. Textures
+## 9. Painting loop (understand the design, then follow it)
 
-- One UV channel, no overlapping islands except mirrored ones the original also mirrors.
-- Texel density equal to the original armor's (measure: texture pixels per cm on the chest).
-- Paint / bake: diffuse colour with baked AO and light detail like the original's hand-painted style; specular mask in
-  alpha (metal high, cloth / skin low). Bake procedural LookDev with reference-forge `rf_lookdev.bake_pbr`, then
-  combine BaseColor + an AO pass into diffuse and Metallic / Roughness into the alpha mask.
-- Skin areas near the neck use the head part's skin colour sampled from its texture (median in linear space).
-- Export `.dds` within the budget size, with the original's compression type (check its header: DXT1 without alpha, DXT5 / DXT3 with
-  alpha). `m2a_checks.dds_info(path)` reads the header.
+The painting must follow the references closely: the job is to fit *their* design onto *our* mesh, not to invent one.
+To do that, first understand what each painted element is.
+
+1. **Element inventory.** From all references at once (Meshy sample, images, models), list every design element:
+   name, where it sits on the body, shape, layer, colour (hex picked from the reference, median of a clean area),
+   material (cloth, leather, gold, steel, fur, skin). Example: `tiger_knee` (knee guard shaped as a tiger head,
+   gold + dark brown), `red_skirt`, `tassels`, `gold_trim_belt`, `skin`.
+2. **Research what you do not understand.** For each element that is unclear from the given references, search the
+   web for multi-view images of the real-world or genre equivalent (e.g. "tiger head knee guard armor", "Chinese
+   lamellar armor tassels", "belt with gold trim back view"); downloads only with the user's approval. Note how it
+   looks from the sides and back, how it is built, where the seams and edges are. Add these to the reference board
+   (one column per reference, as in reference-forge).
+3. **Map elements onto our mesh.** Tag faces with `set_element(obj, faces, name)` (or
+   `elements_from_vertex_groups`). Every face belongs to exactly one element; skin faces are the `skin` element.
+   Render the element map next to each reference in the same view and fix the map until shapes and positions match.
+4. **Skin is copied, never painted.** Skin texels come from the naked body's own texture (same UVs where the faces
+   are the naked body's; otherwise bake naked diffuse onto ours, Selected to Active). Then `match_skin_tone(head, ours)`
+   and `skin_tone_report(head, ours)`: overall ΔE ≤ 2 against the head's skin just above the neck, each body region
+   ΔE ≤ 3. A body darker, redder or paler than the head is a failure.
+5. **Paint each element inside its own mask** (UV mask of its faces, dilated by the padding) with the reference colours
+   and patterns; never paint across element borders. Detail and AO are baked like the original's hand-painted style;
+   specular mask in alpha (metal high, cloth / skin low).
+6. **Check.** `element_color_report(ours, targets)` (per element ΔE ≤ 12 vs the reference colour, no skin-coloured
+   faces on non-skin elements and no other colour on skin), `uv_report` (no overlaps except mirrored ones, islands at
+   least 2 x padding apart: 8 px padding at 1024², 16 px at 2048²), `padding_report` (every island dilated),
+   `seam_continuity_report` (trims and patterns continue across seams, ΔE ≤ 8), texel density spread ≤ 3x. Then
+   side-by-side game-view renders in every reference view, plus the same renders at half and quarter texture size
+   (mip levels).
+7. **Loop** until every check passes and every element matches its reference in shape and colour. Post a paint collage
+   each round: rows = reference views, columns = references, Ours, Element map, Difference.
+
+Export `.dds` within the budget size, with the original's compression type (DXT1 without alpha, DXT5 / DXT3 with
+alpha; `dds_info(path)` reads the header). Re-run `padding_report` on the exported texture.
 
 ## 10. Delivery
 
 1. Run all reports: locks (skeleton + head position), region shift, inputs, rig, weights, neck seam, proportion,
-   pose test, part clipping in all poses, last macro loop pass, head-join gate `PASS`. Post the summary table.
+   pose test, part clipping in all poses, last macro loop pass, head-join gate `PASS`, game-view gate (coverage,
+   open borders, flipped faces, leak test, triangle quality), painting gate (skin tone, element colours, UV,
+   padding, seam continuity). Post the summary table.
 2. Final collage: rows = front, back, side, 3/4, two test poses; columns = Original armor, Meshy sample, references,
    Ours, Difference.
 3. Export through the user's tool (M2 Granny Tools or FBX → 3ds Max → Granny exporter). Re-import the exported file
@@ -341,6 +412,10 @@ Fit and proportion, locks (skeleton, head, region drift), part clipping and the 
 - Judging fit only in bind pose, or only from full-body views (macro close-ups are mandatory).
 - Checking armor as one blob: pieces are checked against each other separately.
 - Assuming community facts are true for this client without checking the user's files.
+- Reviewing with backface culling off (Blender's default): the game culls back faces.
+- Deleting hidden skin or any body region by eye; leaving arms, legs, crotch or feet without geometry.
+- Painting skin by hand, or painting without an element map; painting across element borders.
+- Painting a design element you have not understood from multi-view references.
 
 ## Helper scripts
 
@@ -370,6 +445,13 @@ Fit and proportion, locks (skeleton, head, region drift), part clipping and the 
 | `neck_join_compare(armature, head, orig_armor, our_armor, out_dir, poses=None, views=None)` | Side-by-side ID renders, leak test, head mask IoU, 26 views × poses |
 | `head_join_gate(armature, head, orig_armor, our_armor, out_dir, snapshot, seam='skin')` | All head-join checks; PASS only if all pass |
 | `dds_info(path)` | Width, height, mip count, FourCC (DXT1 / DXT3 / DXT5) |
+| `coverage_report(orig_armor, ours, naked=None, ours_extra=())` | Whole-body coverage per region vs original armor and naked body |
+| `open_edges_report(obj)` / `flipped_faces_report(obj, body)` | Open borders besides the neck / faces pointing into the body |
+| `game_leak_test(armature, pieces, head, naked, out_dir, poses, views, compare_objs)` | Backface-culled hole test with a magenta body core, all views x poses |
+| `tri_quality_report(obj)` | Slivers and spikes |
+| `uv_report(obj, tex_size, padding_px)` / `padding_report(obj)` / `seam_continuity_report(obj)` | UV overlaps and spacing / island dilation / texture continuity across seams |
+| `set_element`, `elements_from_vertex_groups`, `element_color_report(obj, targets)` | Design element map and per-element colour check |
+| `skin_tone_report(head, ours)` / `match_skin_tone(head, ours)` | Body skin vs head skin ΔE / recolour skin texels to the head |
 | `band_report(ref, ours, bands=24, tol=0.01)` | Rig-free (OBJ) proportion and drift check by height bands |
 | `budget_report(objs, max_tris, max_tex, max_mats, calibrate=())` | Triangles, texture size, materials; limits from a recent armor |
 

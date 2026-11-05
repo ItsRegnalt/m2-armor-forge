@@ -32,6 +32,15 @@ toolkit, scoring and compare-and-fix loop.
   never shipped.
 - **Head join at 100%.** Original and new armor are compared with the head side by side from 26 views in every pose
   (leak test, head mask, seam geometry and colour); the loop runs until every check passes.
+- **Game-view gate.** Everything is checked with backface culling on, as the client draws: whole-body coverage vs
+  the original (no missing arms, legs or crotch), open borders, flipped faces, a magenta-core hole test from 26
+  views in every pose (attack poses included), slivers / spikes, pieces clipping into the face.
+- **Painting loop.** Builds an element inventory from the references, researches unclear elements with multi-view
+  images, maps every face to an element and paints inside element masks to follow the design closely. Skin is
+  copied from the game texture and matched to the head (no "tanned neck"); UV padding, mip bleeding and trim
+  continuity across seams are measured.
+- **Failure catalogue.** Known in-game defects (holes under pauldrons, broken trims, colour smears, pauldron in the
+  face on attack, mismatched skin) each mapped to the check that catches it and the fix.
 - **Textures for the client.** DDS format of the original; diffuse alpha as the specular mask.
 - **Speaks your language.** Replies follow your operating system's display language.
 
@@ -111,4 +120,5 @@ koyma, kilitleme, parçalara bölme ve gruplama gibi geri kalan her şeyi skill 
 teyit eder, ardından Meshy örneği ve referanslarla kıyafetsiz gövdeyi giydirir.
 Orijinal iskeleti, kafa konumunu ve boyun dikişini kilitler; göğüs / omuz / kalça kaymasına, omuz genişliği ve
 şişmanlığa karşı ölçüm yapar; kemer, omuzluk, eldiven, bot, dizlik gibi parçaların birbirine clip etmesini her pozda
-ayrı ayrı kontrol eder ve her bölgenin farklı pozlarda makro fotoğrafını çekip temiz çıkana kadar düzeltir.
+ayrı ayrı kontrol eder. Oyunun yaptığı gibi arka yüzleri gizleyerek (backface culling) delik, eksik kol/bacak ve ters yüz arar;
+boyamayı referans elemanlarına göre maskeyle yapar, ten rengini oyunun dokusundan alıp kafayla eşler ve her bölgenin farklı pozlarda makro fotoğrafını çekip temiz çıkana kadar düzeltir.
